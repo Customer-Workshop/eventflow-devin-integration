@@ -65,6 +65,42 @@ def extract_team_id(payload: dict) -> str:
     return ""
 
 
+def classify_alert(alert_payload: dict) -> str:
+    """Classify an Azure Monitor alert into a handler category.
+
+    Inspects the alert rule name and metric conditions to determine
+    whether this is a high-latency alert, a 5xx error spike, or a
+    generic incident.
+
+    Returns:
+        One of: ``"high_latency"``, ``"error_spike"``, or ``"generic"``.
+    """
+    data = alert_payload.get("data", {})
+    essentials = data.get("essentials", {})
+    alert_rule = essentials.get("alertRule", "").lower()
+    description = essentials.get("description", "").lower()
+
+    alert_context = data.get("alertContext", {})
+    conditions = alert_context.get("conditions", [])
+    metric_names = [
+        c.get("metricName", "").lower() for c in conditions
+    ]
+
+    latency_keywords = ["latency", "slow", "duration", "response time", "p95", "p99"]
+    if any(kw in alert_rule for kw in latency_keywords) or any(
+        kw in description for kw in latency_keywords
+    ) or any("duration" in m or "latency" in m or "responsetime" in m for m in metric_names):
+        return "high_latency"
+
+    error_keywords = ["500", "5xx", "error", "exception", "failure", "http5xx"]
+    if any(kw in alert_rule for kw in error_keywords) or any(
+        kw in m for m in metric_names for kw in error_keywords
+    ):
+        return "error_spike"
+
+    return "generic"
+
+
 def build_prompt(team_id: str, alert_payload: dict) -> str:
     """Build the Devin investigation prompt.
 
@@ -128,6 +164,118 @@ Open your fix PR against the `{branch}` branch, not `main`.
 """
 
 
+def build_high_latency_prompt(team_id: str, alert_payload: dict) -> str:
+    """Build a Devin investigation prompt for high-latency alerts.
+
+    Focuses the investigation on database query performance, connection
+    pool exhaustion, and resource contention — the most common causes
+    of latency spikes in the EventFlow payment stack.
+    """
+    data = alert_payload.get("data", {})
+    essentials = data.get("essentials", {})
+
+    fired_at = essentials.get("firedDateTime", datetime.now(timezone.utc).isoformat())
+    severity = essentials.get("severity", "Sev2")
+    alert_rule = essentials.get("alertRule", "High Latency")
+    description = essentials.get("description", "")
+
+    repos_list = "\n".join(
+        f"  - https://github.com/{GITHUB_ORG}/{repo}" for repo in REPOS
+    )
+
+    branch = team_id if team_id else "main"
+    order_url = (
+        f"https://ef-order-{team_id}.salmonbush-13ada168.eastus.azurecontainerapps.io"
+        if team_id
+        else "https://ef-order-team1.salmonbush-13ada168.eastus.azurecontainerapps.io"
+    )
+    payment_url = order_url.replace("ef-order-", "ef-payment-")
+
+    return f"""## Production Incident — High Latency
+
+**Alert Rule**: {alert_rule}
+**Severity**: {severity}
+**Team**: {team_id}
+**Time detected**: {fired_at}
+**Description**: {description}
+
+### Impacted Services
+
+- **Order Service**: {order_url}
+- **Payment Service**: {payment_url}
+
+The payment service is experiencing abnormally high response times. End-user
+requests are timing out or taking significantly longer than normal.
+
+### Production Logs
+
+Query the production logs to understand what is happening. Azure CLI credentials
+are already configured as environment variables (`AZURE_CLIENT_ID`,
+`AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`).
+
+```bash
+az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID -o none
+
+# Slow requests — look for high-duration entries
+az monitor log-analytics query \\
+  --workspace "4cf2afba-136e-4018-9f2d-42b3dbafc3a8" \\
+  --analytics-query "ContainerAppConsoleLogs_CL | where TimeGenerated > ago(2h) | where Log_s has_any ('slow', 'timeout', 'latency', 'pool', 'connection', 'duration') | order by TimeGenerated desc | take 50 | project TimeGenerated, ContainerAppName_s, Log_s" \\
+  -o table
+```
+
+Start by querying the logs. They are the source of truth for what is happening
+at runtime.
+
+### Repositories
+
+{repos_list}
+
+All repos use the `{branch}` branch for this team's deployment.
+
+### Investigation Focus — Database & Connection Pool
+
+High latency in the payment service is most commonly caused by:
+
+1. **Slow database queries** — Look for N+1 query patterns, missing indexes,
+   full table scans, or unoptimised JOINs. Check ORM-generated SQL in the logs.
+2. **Connection pool exhaustion** — Check pool size configuration, connection
+   leak patterns (connections not returned), and pool wait-time metrics. Look
+   for "pool exhausted", "connection timeout", or "waiting for connection" in
+   logs.
+3. **Lock contention** — Look for database deadlocks, long-held row/table
+   locks, or serialisation bottlenecks in transaction-heavy code paths.
+4. **Missing or stale caches** — Check whether frequently-accessed data is
+   cached and whether cache hit rates have dropped.
+5. **External service timeouts** — Verify timeouts and circuit breakers for
+   downstream calls (e.g. payment gateway, order service).
+
+### Your Task
+
+1. **Query logs** — Pull production logs focusing on slow queries, connection
+   pool warnings, and timeout errors.
+2. **Profile database access** — Identify the slowest queries and any
+   connection pool saturation.
+3. **Investigate** — Examine the source code for inefficient data access
+   patterns, missing indexes, or pool misconfiguration.
+4. **Fix** — Open a Pull Request on the appropriate repository against the
+   `{branch}` branch with the fix.
+5. **Verify** — Make sure the fix passes CI.
+
+Open your fix PR against the `{branch}` branch, not `main`.
+"""
+
+
+def route_alert_to_prompt(team_id: str, alert_payload: dict) -> str:
+    """Select the appropriate prompt builder based on alert classification.
+
+    Returns the generated investigation prompt string.
+    """
+    alert_type = classify_alert(alert_payload)
+    if alert_type == "high_latency":
+        return build_high_latency_prompt(team_id, alert_payload)
+    return build_prompt(team_id, alert_payload)
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint for Container App probes."""
@@ -152,7 +300,7 @@ async def alert_webhook(request: Request):
             status_code=500,
         )
 
-    prompt = build_prompt(team_id, payload)
+    prompt = route_alert_to_prompt(team_id, payload)
 
     # Call Devin API (v3)
     try:
